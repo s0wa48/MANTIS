@@ -170,6 +170,10 @@ async def save_loop(datalog: DataLog, stop_event: asyncio.Event):
     logging.info("⏹️ Save loop stopped.")
 
 
+# Create a global lock for subtensor access
+subtensor_lock = threading.Lock()
+
+
 async def run_main_loop(
     args: argparse.Namespace,
     sub: bt.subtensor,
@@ -188,7 +192,9 @@ async def run_main_loop(
     async with aiohttp.ClientSession() as session:
         while not stop_event.is_set():
             try:
-                current_block = sub.get_current_block()
+                with subtensor_lock:
+                    current_block = sub.get_current_block()
+                
                 if current_block == last_block:
                     await asyncio.sleep(1)
                     continue
@@ -200,9 +206,9 @@ async def run_main_loop(
 
                 logging.info(f"Sampled block {current_block}")
 
-
                 if current_block % 100 == 0:
-                    mg.sync(subtensor=sub)
+                    with subtensor_lock:
+                        mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
 
                 price = await get_btc_price(session)
@@ -223,6 +229,10 @@ async def run_main_loop(
                         training_data_snapshot: tuple | None,
                         block_snapshot: int,
                         metagraph: bt.metagraph,
+                        network: str,
+                        netuid: int,
+                        wallet_name: str,
+                        wallet_hotkey: str,
                     ):
                         if not training_data_snapshot:
                             weights_logger.warning("Not enough data to compute salience.")
@@ -252,16 +262,24 @@ async def run_main_loop(
                             return
 
                         w_norm = w / w.sum()
-                        sub.set_weights(
-                            netuid=args.netuid,
-                            wallet=wallet,
-                            uids=uids_to_set,
-                            weights=w_norm,
-                            wait_for_inclusion=False,
-                        )
-                        weights_logger.info(
-                            f"Weights set at block {block_snapshot} (max={w_norm.max():.4f})"
-                        )
+                        
+                        # Create a new subtensor instance for this thread
+                        try:
+                            thread_sub = bt.subtensor(network=network)
+                            thread_wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
+                            
+                            thread_sub.set_weights(
+                                netuid=netuid,
+                                wallet=thread_wallet,
+                                uids=uids_to_set,
+                                weights=w_norm,
+                                wait_for_inclusion=False,
+                            )
+                            weights_logger.info(
+                                f"Weights set at block {block_snapshot} (max={w_norm.max():.4f})"
+                            )
+                        except Exception as e:
+                            weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
 
                     max_block_for_training = current_block - config.TASK_INTERVAL
                     async with datalog._lock:
@@ -272,7 +290,15 @@ async def run_main_loop(
 
                     weight_thread = threading.Thread(
                         target=worker,
-                        args=(training_data_copy, current_block, mg),
+                        args=(
+                            training_data_copy, 
+                            current_block, 
+                            mg,
+                            args.network,
+                            args.netuid,
+                            getattr(args, "wallet.name"),
+                            getattr(args, "wallet.hotkey"),
+                        ),
                         daemon=True,
                     )
                     weight_thread.start()
