@@ -215,7 +215,8 @@ def salience(
     if total_importance > 1e-9:
         salience_dict = {uid: score / total_importance for uid, score in final_importance.items()}
     else:
-        salience_dict = {uid: 1.0 / len(all_uids) for uid in all_uids if all_uids}
+        logger.warning("Total importance is zero. Salience cannot be determined, skipping weight set.")
+        return {}
 
     logger.info("XGBoost-based salience computation complete in %.2fs", time.time() - t0)
     return salience_dict
