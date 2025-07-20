@@ -205,6 +205,9 @@ def salience(
         else:
             logger.warning(f"No validation windows processed for {asset_name}.")
 
+    if not asset_uid_importance:
+        return {}
+
     final_importance = {uid: 0.0 for uid in all_uids}
     for asset_name, importances in asset_uid_importance.items():
         for uid, importance_score in importances.items():
