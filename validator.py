@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 
 import config
 from cycle import get_miner_payloads
-from model import salience as sal_fn
+from model import salience as sal_fn, ten_day_saliences
 from storage import DataLog
 
 LOG_DIR = os.path.expanduser("~/new_system_mantis")
@@ -66,7 +66,7 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-SAVE_INTERVAL = 120
+SAVE_INTERVAL = 480
 
 
 async def _fetch_price_source(session, url, parse_json=True):
@@ -220,6 +220,7 @@ async def run_main_loop(
                         mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
                     await datalog.sync_miners(dict(zip(mg.uids.tolist(), mg.hotkeys)))
+                    datalog.compute_and_display_uid_ages()
 
                 asset_prices = await get_asset_prices(session)
                 if not asset_prices:
@@ -234,22 +235,82 @@ async def run_main_loop(
                     and (weight_thread is None or not weight_thread.is_alive())
                     and len(datalog.blocks) >= config.LAG * 2 + 1
                 ):
-                    def worker(training_data, block_snapshot, metagraph, cli_args):
+                    def worker(training_data, uid_ages, block_snapshot, metagraph, cli_args):
                         if not training_data:
-                            weights_logger.warning("Not enough data for salience.")
-                            return
+                            weights_logger.warning("Not enough data for salience, but checking for young UIDs.")
                         
-                        weights_logger.info(f"=== Starting multi-asset salience | block {block_snapshot} ===")
-                        sal = sal_fn(training_data)
+                        weights_logger.info(f"=== Starting weight calculation | block {block_snapshot} ===")
+                        
+                        weights_logger.info("Calculating general salience...")
+                        general_sal = sal_fn(training_data) if training_data else {}
+                        if not general_sal:
+                            weights_logger.info("General salience computation returned empty.")
+
+                        weights_logger.info("Calculating 10-day salience...")
+                        ten_day_sal = ten_day_saliences(training_data) if training_data else {}
+                        if not ten_day_sal:
+                            weights_logger.info("10-day salience computation returned empty.")
+
+                        all_uids_from_salience = set(general_sal.keys()) | set(ten_day_sal.keys())
+                        
+                        combined_sal = {
+                            uid: 0.5 * general_sal.get(uid, 0.0) + 0.5 * ten_day_sal.get(uid, 0.0)
+                            for uid in all_uids_from_salience
+                        }
+                        
+                        sal = combined_sal
 
                         if not sal:
-                            weights_logger.info("Salience computation returned empty.")
+                            weights_logger.info("Combined salience is empty. Assigning weights only to young UIDs if any.")
+                        
+                        uids = metagraph.uids.tolist()
+                        
+                        young_uids = {uid for uid, age in uid_ages.items() if age < 36000}
+                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<36000 blocks).")
+
+                        mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
+                        
+                        total_mature_score = sum(mature_uid_scores.values())
+                        
+                        fixed_weight_per_young_uid = 0.0001
+                        
+                        active_young_uids = {uid for uid in young_uids if uid in uids}
+                        
+                        weight_for_mature_uids = 1.0 - (len(active_young_uids) * fixed_weight_per_young_uid)
+                        weight_for_mature_uids = max(0, weight_for_mature_uids)
+
+                        final_weights = {}
+
+                        if total_mature_score > 0 and weight_for_mature_uids > 0:
+                            for uid, score in mature_uid_scores.items():
+                                if uid in uids:
+                                    final_weights[uid] = (score / total_mature_score) * weight_for_mature_uids
+                        
+                        for uid in active_young_uids:
+                            final_weights[uid] = fixed_weight_per_young_uid
+
+                        if not final_weights:
+                            weights_logger.warning("No weights to set after processing.")
+                            return
+
+                        total_weight = sum(final_weights.values())
+                        if total_weight <= 0:
+                            weights_logger.warning("Total calculated weight is zero or negative, skipping set.")
                             return
                         
-                        w = torch.tensor([sal.get(uid, 0.0) for uid in metagraph.uids.tolist()], dtype=torch.float32)
-                        if w.sum() <= 0:
-                            weights_logger.warning("Zero-sum weights, skipping set.")
+                        normalized_weights = {uid: w / total_weight for uid, w in final_weights.items()}
+
+                        w = torch.tensor([normalized_weights.get(uid, 0.0) for uid in uids], dtype=torch.float32)
+                        
+                        if w.sum() > 0:
+                            final_w = w / w.sum()
+                        else:
+                            weights_logger.warning("Zero-sum weights tensor, skipping set.")
                             return
+                        
+                        weights_to_log = {uid: f"{weight:.8f}" for uid, weight in normalized_weights.items() if uid in uids and weight > 0}
+                        weights_logger.info(f"Normalized weights for block {block_snapshot}: {json.dumps(weights_to_log)}")
+                        weights_logger.info(f"Final tensor sum before setting weights: {final_w.sum().item()}")
                         
                         try:
                             thread_sub = bt.subtensor(network=cli_args.network)
@@ -259,20 +320,21 @@ async def run_main_loop(
                             )
                             thread_sub.set_weights(
                                 netuid=cli_args.netuid, wallet=thread_wallet,
-                                uids=metagraph.uids, weights=w / w.sum(),
+                                uids=metagraph.uids, weights=final_w,
                                 wait_for_inclusion=False,
                             )
-                            weights_logger.info(f"Weights set at block {block_snapshot} (max={w.max():.4f})")
+                            weights_logger.info(f"Weights set at block {block_snapshot} (max={final_w.max():.4f})")
                         except Exception as e:
                             weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
 
                     max_block_for_training = current_block - config.TASK_INTERVAL
                     async with datalog._lock:
                         training_data_copy = copy.deepcopy(datalog.get_training_data(max_block_number=max_block_for_training))
+                        uid_ages_copy = copy.deepcopy(datalog.uid_age_in_blocks)
 
                     weight_thread = threading.Thread(
                         target=worker,
-                        args=(training_data_copy, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
+                        args=(training_data_copy, uid_ages_copy, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
                         daemon=True,
                     )
                     weight_thread.start()
