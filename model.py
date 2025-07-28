@@ -119,6 +119,11 @@ def salience(
                 X[:, idx * emb_dim : (idx + 1) * emb_dim] = np.array(hist, dtype=np.float32)
         y_bin = (np.array(asset_returns, dtype=np.float32) > 0).astype(float)
 
+        valid_rows = ~np.isnan(y_bin)
+        X = X[valid_rows]
+        y_bin = y_bin[valid_rows]
+        T = X.shape[0]
+
         total_uid_imp = np.zeros(num_uids)
         num_windows = 0
         total_val_acc = 0.0
@@ -184,5 +189,7 @@ def salience(
             final_imp[uid] += score
     total = sum(final_imp.values())
     return {uid: s/total for uid, s in final_imp.items()} if total > 1e-9 else {}
+
+
 
 
