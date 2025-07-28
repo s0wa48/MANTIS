@@ -301,6 +301,14 @@ class DataLog:
         async with self._lock:
             payloads_to_process = copy.deepcopy(self.raw_payloads)
             current_block = self.blocks[-1] if self.blocks else 0
+
+            max_ts = len(self.blocks)
+            valid_timesteps = {ts for ts in payloads_to_process if ts < max_ts}
+            if len(valid_timesteps) != len(payloads_to_process):
+                invalid_keys = set(payloads_to_process.keys()) - valid_timesteps
+                logger.warning(f"Found {len(invalid_keys)} invalid timesteps in raw_payloads: {invalid_keys}. Ignoring them.")
+                payloads_to_process = {ts: payloads_to_process[ts] for ts in valid_timesteps}
+
             block_map = {ts: self.blocks[ts] for ts in payloads_to_process}
 
         if not payloads_to_process:
@@ -470,15 +478,10 @@ class DataLog:
             
             price_series = []
             for t in range(T):
-                if t < len(asset_prices) and asset in asset_prices[t]:
+                if t < len(asset_prices) and asset_prices[t] and asset in asset_prices[t]:
                     price_series.append(asset_prices[t][asset])
                 else:
-                    price_series = None
-                    break
-            
-            if price_series is None:
-                logger.warning(f"Missing price data for {asset}, skipping")
-                continue
+                    price_series.append(np.nan)
             
             price_series = self._filter_unchanged_prices(price_series, config.MAX_UNCHANGED_TIMESTEPS)
             
@@ -565,6 +568,7 @@ class DataLog:
             datalog_ref = self  # reference only; no deepcopy while holding the lock
 
         try:
+            # Off-load deepcopy + disk I/O to a background thread
             await asyncio.to_thread(_deepcopy_and_save, datalog_ref, path)
             logger.info(f"✅ Datalog saved to {path}")
         except Exception as e:
@@ -625,3 +629,5 @@ def _save_datalog(datalog: "DataLog", path: str) -> None:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise 
+
+
