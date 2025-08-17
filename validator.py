@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 
 import config
 from cycle import get_miner_payloads
-from model import salience as sal_fn, ten_day_saliences
+from model import salience as sal_fn
 from storage import DataLog
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
