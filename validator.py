@@ -1,24 +1,3 @@
-# MIT License
-#
-# Copyright (c) 2024 MANTIS
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
 
 from __future__ import annotations
 
@@ -30,6 +9,8 @@ import time
 import asyncio
 import copy
 import json
+import gzip
+import pickle
 
 import bittensor as bt
 import torch
@@ -41,7 +22,8 @@ from cycle import get_miner_payloads
 from model import salience as sal_fn, ten_day_saliences
 from storage import DataLog
 
-LOG_DIR = os.path.expanduser("~/new_system_mantis")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(_BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -66,29 +48,7 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-SAVE_INTERVAL = 480
-
-
-async def _fetch_price_source(session, url, parse_json=True):
-    async with session.get(url, timeout=5) as resp:
-        resp.raise_for_status()
-        if parse_json:
-            return await resp.json()
-        else:
-            return await resp.text()
-
-async def _get_price_from_sources(session, source_list):
-    for name, url, parser in source_list:
-        try:
-            parse_json = not url.endswith("e=csv")
-            data = await _fetch_price_source(session, url, parse_json=parse_json)
-            price = parser(data)
-            if price is not None:
-                return price
-        except Exception:
-            continue
-    return None
-
+SAVE_INTERVAL = 120
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
     try:
@@ -120,6 +80,16 @@ def main():
         default=False,
         help="Whether to save the datalog periodically."
     )
+    p.add_argument(
+        "--archive",
+        default=None,
+        help="Path to local datalog .pkl.gz (defaults to STORAGE_DIR/mantis_datalog.pkl.gz)"
+    )
+    p.add_argument(
+        "--prefer_local",
+        action="store_true",
+        help="If set, load existing local archive if it exists; otherwise download"
+    )
     args = p.parse_args()
 
     while True:
@@ -137,7 +107,22 @@ def main():
         logging.info("`--no_download_datalog` flag set. Starting with a new, empty DataLog.")
         datalog = DataLog()
     else:
-        datalog = DataLog.load(DATALOG_PATH)
+        archive_path = args.archive or DATALOG_PATH
+        if args.prefer_local and os.path.exists(archive_path):
+            logging.info("Loading local datalog from %s", archive_path)
+            try:
+                with gzip.open(archive_path, "rb") as f:
+                    datalog = pickle.load(f)
+                try:
+                    datalog.raw_payloads = {}
+                    logging.info("Pruned raw_payloads after local load (prefer_local).")
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.warning("Local load failed (%s). Falling back to download.", e)
+                datalog = DataLog.load(archive_path)
+        else:
+            datalog = DataLog.load(archive_path)
         
     stop_event = asyncio.Event()
 
@@ -246,62 +231,42 @@ async def run_main_loop(
                         if not general_sal:
                             weights_logger.info("General salience computation returned empty.")
 
-                        weights_logger.info("Calculating 10-day salience...")
-                        ten_day_sal = ten_day_saliences(training_data) if training_data else {}
-                        if not ten_day_sal:
-                            weights_logger.info("10-day salience computation returned empty.")
-
-                        all_uids_from_salience = set(general_sal.keys()) | set(ten_day_sal.keys())
-                        
-                        combined_sal = {
-                            uid: 0.5 * general_sal.get(uid, 0.0) + 0.5 * ten_day_sal.get(uid, 0.0)
-                            for uid in all_uids_from_salience
-                        }
-                        
-                        sal = combined_sal
+                        weights_logger.info("Using general salience only (10-day skipped).")
+                        sal = general_sal
 
                         if not sal:
                             weights_logger.info("Combined salience is empty. Assigning weights only to young UIDs if any.")
-                        
+                            
                         uids = metagraph.uids.tolist()
-                        
-                        young_uids = {uid for uid, age in uid_ages.items() if age < 36000}
-                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<36000 blocks).")
-
-                        mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
-                        
-                        total_mature_score = sum(mature_uid_scores.values())
+                            
+                       
+                        young_uids = {uid for uid, age in uid_ages.items() if age < 32000}
+                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<32000 blocks).")
                         
                         fixed_weight_per_young_uid = 0.0001
-                        
                         active_young_uids = {uid for uid in young_uids if uid in uids}
                         
-                        weight_for_mature_uids = 1.0 - (len(active_young_uids) * fixed_weight_per_young_uid)
-                        weight_for_mature_uids = max(0, weight_for_mature_uids)
-
-                        final_weights = {}
-
-                        if total_mature_score > 0 and weight_for_mature_uids > 0:
-                            for uid, score in mature_uid_scores.items():
-                                if uid in uids:
-                                    final_weights[uid] = (score / total_mature_score) * weight_for_mature_uids
+                       
+                       
+                        final_weights = {uid: float(sal.get(uid, 0.0)) for uid in uids}
                         
+                       
                         for uid in active_young_uids:
-                            final_weights[uid] = fixed_weight_per_young_uid
-
+                            final_weights[uid] = final_weights.get(uid, 0.0) + fixed_weight_per_young_uid
+                            
                         if not final_weights:
                             weights_logger.warning("No weights to set after processing.")
                             return
-
+                            
                         total_weight = sum(final_weights.values())
                         if total_weight <= 0:
                             weights_logger.warning("Total calculated weight is zero or negative, skipping set.")
                             return
-                        
+                            
                         normalized_weights = {uid: w / total_weight for uid, w in final_weights.items()}
-
+                            
                         w = torch.tensor([normalized_weights.get(uid, 0.0) for uid in uids], dtype=torch.float32)
-                        
+                            
                         if w.sum() > 0:
                             final_w = w / w.sum()
                         else:
