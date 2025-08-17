@@ -103,7 +103,7 @@ class DataLog:
                         f"Ownership change for UID {uid}: '{prev_hotkey[:8]}...' -> '{hotkey[:8]}...'. "
                         f"Wiping history for this UID."
                     )
-                    # Wipe historical data for the UID before backfilling.
+                   
                     [sc.pop(uid, None) for sc in self.plaintext_cache]
                     [sp.pop(uid, None) for sp in self.raw_payloads.values()]
 
@@ -136,9 +136,7 @@ class DataLog:
         
         logger.info(f"UID ages recomputed for {len(self.uid_age_in_blocks)} UIDs.")
 
-    def recompute_uid_ages(self):
-        """Public method to trigger UID age recalculation, intended for scripts."""
-        self._recompute_uid_age_unsafe()
+    
 
     def compute_and_display_uid_ages(self):
         """Computes and displays the age of each UID in blocks and hours."""
@@ -151,7 +149,7 @@ class DataLog:
         
         for uid in sorted_uids:
             age_in_blocks = self.uid_age_in_blocks[uid]
-            age_in_hours = (age_in_blocks * 12) / 3600  # Assuming 12s block time
+            age_in_hours = (age_in_blocks * 12) / 3600 
             logger.info(f"UID {uid:<4} | Age: {age_in_blocks:<7} blocks (~{age_in_hours:<5.1f} hours)")
         logger.info("----------------")
 
@@ -176,7 +174,7 @@ class DataLog:
         try:
             url = f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}"
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
+                async with session.get(url, timeout=30) as response:
                     if response.status == 200:
                         data = await response.json()
                         logger.debug(f"✅ Signature fetched for round {round_num}")
@@ -199,11 +197,15 @@ class DataLog:
     ) -> None:
         async with self._lock:
             self.blocks.append(block)
-            self.asset_prices.append(asset_prices)
+            try:
+                prices_fp32 = {k: (v if isinstance(v, np.ndarray) and v.dtype == np.float32 else np.float32(v)) for k, v in (asset_prices or {}).items()}
+            except Exception:
+                prices_fp32 = {k: np.float32(v) for k, v in (asset_prices or {}).items()}
+            self.asset_prices.append(prices_fp32)
             self.plaintext_cache.append({})
 
             current_timestep = len(self.blocks) - 1
-            self.raw_payloads[current_timestep] = {}
+            self.raw_payloads[block] = {}
 
             all_known_uids = self._get_all_uids_unsafe()
             for uid in all_known_uids:
@@ -211,7 +213,7 @@ class DataLog:
                     payloads[uid] = ENCRYPTED_ZERO_PAYLOAD
 
             for uid, payload in payloads.items():
-                self.raw_payloads[current_timestep][uid] = payload
+                self.raw_payloads[block][uid] = payload
 
                 if not self._is_known_uid_unsafe(uid):
                     self._backfill_new_uid_unsafe(uid)
@@ -224,24 +226,15 @@ class DataLog:
             uids.update(step_payloads.keys())
         return sorted(list(uids))
 
-    def get_all_uids_sync(self) -> List[int]:
-        return self._get_all_uids_unsafe()
-
-    def is_known_uid(self, uid: int) -> bool:
-        if not self.plaintext_cache:
-            return False
-        return uid in self.plaintext_cache[0]
+    
 
     def _is_known_uid_unsafe(self, uid: int) -> bool:
         if not self.plaintext_cache:
             return False
         return uid in self.plaintext_cache[0]
 
-    def _create_zero_embeddings(self) -> Dict[str, List[float]]:
-        return {
-            asset: [0.0] * config.ASSET_EMBEDDING_DIMS[asset] 
-            for asset in config.ASSETS
-        }
+    def _create_zero_embeddings(self) -> Dict[str, np.ndarray]:
+        return {asset: np.zeros(config.ASSET_EMBEDDING_DIMS[asset], dtype=np.float16) for asset in config.ASSETS}
 
     def _parse_and_validate_submission(self, submission: Any) -> Dict[str, List[float]]:
         """
@@ -250,7 +243,7 @@ class DataLog:
         New format: List[List[float]] (one list per asset in order)
         """
         try:
-            # Check if this is the new format (list of lists)
+           
             if (isinstance(submission, list) and 
                 len(submission) == len(config.ASSETS) and
                 all(isinstance(asset_vec, list) for asset_vec in submission)):
@@ -266,7 +259,7 @@ class DataLog:
                 
                 return result
             
-            # Invalid format
+           
             logger.warning(f"Invalid submission format: {type(submission)}")
             return self._create_zero_embeddings()
             
@@ -302,27 +295,25 @@ class DataLog:
             payloads_to_process = copy.deepcopy(self.raw_payloads)
             current_block = self.blocks[-1] if self.blocks else 0
 
-            max_ts = len(self.blocks)
-            valid_timesteps = {ts for ts in payloads_to_process if ts < max_ts}
-            if len(valid_timesteps) != len(payloads_to_process):
-                invalid_keys = set(payloads_to_process.keys()) - valid_timesteps
+            block_to_idx = {b: i for i, b in enumerate(self.blocks)}
+            valid_blocks = {b for b in payloads_to_process if b in block_to_idx}
+            if len(valid_blocks) != len(payloads_to_process):
+                invalid_keys = set(payloads_to_process.keys()) - valid_blocks
                 logger.warning(f"Found {len(invalid_keys)} invalid timesteps in raw_payloads: {invalid_keys}. Ignoring them.")
-                payloads_to_process = {ts: payloads_to_process[ts] for ts in valid_timesteps}
-
-            block_map = {ts: self.blocks[ts] for ts in payloads_to_process}
+                payloads_to_process = {b: payloads_to_process[b] for b in valid_blocks}
 
         if not payloads_to_process:
             return
 
         rounds_to_process: Dict[int, List[Dict]] = {}
-        timesteps_to_discard = []
+        blocks_to_discard = []
 
-        for ts, payloads_at_step in payloads_to_process.items():
-            block_age = current_block - block_map[ts]
+        for blk, payloads_at_step in payloads_to_process.items():
+            block_age = current_block - blk
 
             if block_age > 600:
-                logger.warning(f"Discarding stale raw payloads at timestep {ts} (age: {block_age} blocks)")
-                timesteps_to_discard.append(ts)
+                logger.warning(f"Discarding stale raw payloads at block {blk} (age: {block_age} blocks)")
+                blocks_to_discard.append(blk)
                 continue
             
             if not (300 <= block_age):
@@ -334,12 +325,12 @@ class DataLog:
                     if round_num not in rounds_to_process:
                         rounds_to_process[round_num] = []
                     rounds_to_process[round_num].append(
-                        {"ts": ts, "uid": uid, "ct_hex": payload_dict["ciphertext"]}
+                        {"block": blk, "uid": uid, "ct_hex": payload_dict["ciphertext"]}
                     )
                 except Exception:
                     if "malformed" not in rounds_to_process:
                         rounds_to_process["malformed"] = []
-                    rounds_to_process["malformed"].append({"ts": ts, "uid": uid})
+                    rounds_to_process["malformed"].append({"block": blk, "uid": uid})
         
         sem = asyncio.Semaphore(16)
         decrypted_results = {}
@@ -349,8 +340,8 @@ class DataLog:
             nonlocal processed_keys
             if round_num == "malformed":
                 for item in items:
-                    decrypted_results.setdefault(item["ts"], {})[item["uid"]] = self._create_zero_embeddings()
-                    processed_keys.append((item['ts'], item['uid']))
+                    decrypted_results.setdefault(item["block"], {})[item["uid"]] = self._create_zero_embeddings()
+                    processed_keys.append((item['block'], item['uid']))
                 return
 
             async with sem:
@@ -360,12 +351,12 @@ class DataLog:
 
                 logger.info(f"Decrypting batch of {len(items)} payloads for Drand round {round_num}")
                 for item in items:
-                    ts, uid, ct_hex = item["ts"], item["uid"], item["ct_hex"]
+                    blk, uid, ct_hex = item["block"], item["uid"], item["ct_hex"]
                     is_valid = False
                     try:
                         pt_bytes = self.tlock.tld(bytes.fromhex(ct_hex), sig)
                         
-                        DECRYPTED_PAYLOAD_LIMIT_BYTES = 32 * 1024 # 32KB limit
+                        DECRYPTED_PAYLOAD_LIMIT_BYTES = 32 * 1024
                         if len(pt_bytes) > DECRYPTED_PAYLOAD_LIMIT_BYTES:
                             raise ValueError(f"Decrypted payload size {len(pt_bytes)} exceeds limit")
 
@@ -379,47 +370,57 @@ class DataLog:
                         embeddings_str, payload_hotkey = parts
                         
                         expected_hotkey = uid_to_hotkey.get(uid)
-                        if not expected_hotkey or payload_hotkey != expected_hotkey:
-                            raise ValueError(f"Hotkey mismatch for UID {uid}. Expected {expected_hotkey[:8]}, got {payload_hotkey[:8]}")
+                        payload_hotkey_norm = (payload_hotkey or "").strip()
+                        expected_hotkey_norm = (expected_hotkey or "").strip()
+                        if not expected_hotkey_norm:
+                            raise ValueError(f"Missing expected hotkey for UID {uid}")
+                        if payload_hotkey_norm.lower() != expected_hotkey_norm.lower():
+                            raise ValueError(
+                                f"Hotkey mismatch for UID {uid}. Expected {expected_hotkey_norm[:8]}, got {payload_hotkey_norm[:8]}"
+                            )
 
                         submission = ast.literal_eval(embeddings_str)
                         result = self._parse_and_validate_submission(submission)
                         is_valid = True
                     except Exception as e:
-                        logger.warning(f"tlock decryption failed for UID {uid} at ts {ts}: {e}")
+                        logger.warning(f"tlock decryption failed for UID {uid} at block {blk}: {e}")
                         result = self._create_zero_embeddings()
                     
-                    decrypted_results.setdefault(ts, {})[uid] = result
-                    processed_keys.append((ts, uid))
+                    if isinstance(result, dict):
+                        result = {a: (v if isinstance(v, np.ndarray) and v.dtype==np.float16 else np.asarray(v, dtype=np.float16)) for a, v in result.items()}
+                    decrypted_results.setdefault(blk, {})[uid] = result
+                    processed_keys.append((blk, uid))
                 return is_valid
 
         tasks = [_fetch_and_decrypt(r, i) for r, i in rounds_to_process.items()]
         results = await asyncio.gather(*tasks)
 
         total_payloads = sum(len(i) for i in rounds_to_process.values())
-        valid_payloads = sum(res for res in results if isinstance(res, bool) and res) # Filter out Nones
+        valid_payloads = sum(res for res in results if isinstance(res, bool) and res)
         
         if total_payloads > 0:
             valid_percentage = (valid_payloads / total_payloads) * 100
             logger.info(f"Decryption round complete. Valid payloads: {valid_payloads}/{total_payloads} ({valid_percentage:.1f}%)")
 
-        if decrypted_results or processed_keys or timesteps_to_discard:
+        if decrypted_results or processed_keys or blocks_to_discard:
             async with self._lock:
-                for ts, uid_vectors in decrypted_results.items():
-                    if ts < len(self.plaintext_cache):
-                        self.plaintext_cache[ts].update(uid_vectors)
+                block_to_idx_inner = {b: i for i, b in enumerate(self.blocks)}
+                for blk, uid_vectors in decrypted_results.items():
+                    idx = block_to_idx_inner.get(blk)
+                    if idx is not None and idx < len(self.plaintext_cache):
+                        self.plaintext_cache[idx].update(uid_vectors)
 
-                for ts, uid in processed_keys:
-                    if ts in self.raw_payloads and uid in self.raw_payloads[ts]:
-                        del self.raw_payloads[ts][uid]
-                        if not self.raw_payloads[ts]:
-                            del self.raw_payloads[ts]
+                for blk, uid in processed_keys:
+                    if blk in self.raw_payloads and uid in self.raw_payloads[blk]:
+                        del self.raw_payloads[blk][uid]
+                        if not self.raw_payloads[blk]:
+                            del self.raw_payloads[blk]
 
-                for ts in timesteps_to_discard:
-                    if ts in self.raw_payloads:
-                        del self.raw_payloads[ts]
+                for blk in blocks_to_discard:
+                    if blk in self.raw_payloads:
+                        del self.raw_payloads[blk]
 
-    def get_training_data(self, max_block_number: int | None = None) -> Dict[str, tuple[dict[int, list], list[float]]] | None:
+    def get_training_data(self, max_block_number: int | None = None) -> Dict[str, tuple[dict[int, list], list[float], list[int]]] | None:
         """
         Get training data for all assets with price change filtering.
         
@@ -466,9 +467,9 @@ class DataLog:
 
         T = len(blocks)
         all_uids = self._get_all_uids_unsafe()
-        # Map each observed block number to its index for O(1) lookup when searching
-        # for the price exactly `TARGET_BLOCK_DIFF` blocks ahead.
-        TARGET_BLOCK_DIFF = 300  # compute returns relative to +300 blockchain blocks
+       
+       
+        TARGET_BLOCK_DIFF = 300 
         block_to_idx = {b: i for i, b in enumerate(blocks)}
 
         result = {}
@@ -488,12 +489,12 @@ class DataLog:
             asset_returns = []
             valid_embedding_indices = []
 
-            # Calculate returns based on block numbers: look exactly TARGET_BLOCK_DIFF blocks ahead.
+           
             for t_idx, p_initial in enumerate(price_series):
                 target_block = blocks[t_idx] + TARGET_BLOCK_DIFF
                 j = block_to_idx.get(target_block)
                 if j is None:
-                    continue  # no price sample exactly 300 blocks ahead; skip
+                    continue 
 
                 p_final = price_series[j]
 
@@ -509,14 +510,15 @@ class DataLog:
             
             for t_idx in valid_embedding_indices:
                 for uid in all_uids:
-                    vector = [0.0] * config.ASSET_EMBEDDING_DIMS[asset]
+                    vector = np.zeros(config.ASSET_EMBEDDING_DIMS[asset], dtype=np.float16)
                     if t_idx < len(plaintext_cache):
                         cache_entry = plaintext_cache[t_idx].get(uid, {})
                         if isinstance(cache_entry, dict) and asset in cache_entry:
-                            vector = cache_entry[asset]
+                            vector = np.asarray(cache_entry[asset], dtype=np.float16)
                     history_dict[uid].append(vector)
 
-            result[asset] = (history_dict, asset_returns)
+            sample_blocks = [blocks[t_idx] for t_idx in valid_embedding_indices]
+            result[asset] = (history_dict, asset_returns, sample_blocks)
             logger.info(f"Created training data for {asset}: {len(asset_returns)} samples")
         
         if not result:
@@ -563,14 +565,14 @@ class DataLog:
         so other coroutines can continue almost uninterrupted.
         """
 
-        # Grab a reference under the lock for consistency.
+       
         async with self._lock:
-            datalog_ref = self  # reference only; no deepcopy while holding the lock
+            datalog_ref = self 
 
         try:
-            # Off-load deepcopy + disk I/O to a background thread
+           
             await asyncio.to_thread(_deepcopy_and_save, datalog_ref, path)
-            logger.info(f"✅ Datalog saved to {path}")
+            logger.info(f"Datalog saved to {path}")
         except Exception as e:
             logger.error(f"Failed to save datalog to {path}: {e}")
 
@@ -578,7 +580,6 @@ class DataLog:
     def load(path: str) -> "DataLog":
         logger.info(f"Fetching latest datalog from R2 bucket: {config.DATALOG_ARCHIVE_URL}")
         try:
-            # Ensure the target directory exists before trying to download.
             os.makedirs(os.path.dirname(path), exist_ok=True)
             
             url = config.DATALOG_ARCHIVE_URL
@@ -596,6 +597,11 @@ class DataLog:
             with gzip.open(path, "rb") as f:
                 log = pickle.load(f)
             logger.info(f"Loaded DataLog from {path}")
+            try:
+                log.raw_payloads = {}
+                logger.info("Pruned raw_payloads on load (cleared any archived queue).")
+            except Exception:
+                pass
             return log
 
         except (requests.exceptions.RequestException, pickle.UnpicklingError, gzip.BadGzipFile) as e:
