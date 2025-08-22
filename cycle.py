@@ -40,10 +40,29 @@ async def get_miner_payloads(
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
     payloads = {}
 
+    total_uids = len(mg.uids)
+    filtered_non_r2 = 0
+
+    def _is_valid_r2_url(url: str) -> bool:
+        try:
+            pu = urlparse(url)
+            host = (pu.hostname or "").lower()
+            if host.endswith(".r2.dev") or host.endswith(".r2.cloudflarestorage.com"):
+                return True
+            return False
+        except Exception:
+            return False
+
     async def _fetch_one(uid: int):
+        nonlocal filtered_non_r2
         hotkey = uid2hot.get(uid)
         object_url = commits.get(hotkey) if hotkey else None
         if not object_url:
+            return
+
+        if not _is_valid_r2_url(object_url):
+            filtered_non_r2 += 1
+            logger.warning(f"UID {uid} filtered: non-R2 URL {object_url}")
             return
 
         try:
@@ -80,6 +99,13 @@ async def get_miner_payloads(
     await asyncio.gather(*(
         _fetch_one(int(u)) for u in mg.uids
     ), return_exceptions=True)
+
+                                         
+    try:
+        pct = (filtered_non_r2 / max(1, total_uids)) * 100.0
+        logger.info(f"Filtered non-R2 URLs this round: {filtered_non_r2}/{total_uids} ({pct:.2f}%)")
+    except Exception:
+        pass
 
     return payloads
 
