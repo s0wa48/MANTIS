@@ -16,11 +16,15 @@ import bittensor as bt
 import torch
 import aiohttp
 from dotenv import load_dotenv
+from logging.handlers import RotatingFileHandler
+import numpy as np
+import gc
 
 import config
 from cycle import get_miner_payloads
 from model import salience as sal_fn
 from storage import DataLog
+from get_training_data import build_training_data, coerce_plaintext_cache_to_dtype
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(_BASE_DIR, "logs")
@@ -36,10 +40,11 @@ logging.basicConfig(
 )
 
 weights_logger = logging.getLogger("weights")
-weights_logger.setLevel(logging.DEBUG)
-weights_logger.addHandler(
-    logging.FileHandler(os.path.join(LOG_DIR, "weights.log"), mode="a")
+weights_logger.setLevel(logging.INFO)
+weights_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "weights.log"), mode="a", maxBytes=20 * 1024 * 1024, backupCount=3
 )
+weights_logger.addHandler(weights_handler)
 
 for noisy in ("websockets", "aiohttp"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -48,7 +53,7 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-SAVE_INTERVAL = 120
+SAVE_INTERVAL = 480
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
     try:
@@ -124,6 +129,13 @@ def main():
         else:
             datalog = DataLog.load(archive_path)
         
+                                                                           
+    try:
+        converted = coerce_plaintext_cache_to_dtype(datalog, np.float16)
+        logging.info(f"Coerced {converted} asset vectors to np.float16 in plaintext_cache.")
+    except Exception:
+        logging.exception("Failed to coerce plaintext_cache to fp16")
+
     stop_event = asyncio.Event()
 
     try:
@@ -188,6 +200,15 @@ async def run_main_loop(
     async with aiohttp.ClientSession() as session:
         while not stop_event.is_set():
             try:
+                                                                                 
+                if weight_thread is not None and not weight_thread.is_alive():
+                    try:
+                        weight_thread.join(timeout=0.1)
+                    except Exception:
+                        pass
+                    weight_thread = None
+                    gc.collect()
+
                 with subtensor_lock:
                     current_block = sub.get_current_block()
                 
@@ -220,7 +241,7 @@ async def run_main_loop(
                     and (weight_thread is None or not weight_thread.is_alive())
                     and len(datalog.blocks) >= config.LAG * 2 + 1
                 ):
-                    def worker(training_data, uid_ages, block_snapshot, metagraph, cli_args):
+                    def worker(training_data, uid_ages, block_snapshot, uids_list, network, wallet_name, wallet_hotkey, netuid):
                         if not training_data:
                             weights_logger.warning("Not enough data for salience, but checking for young UIDs.")
                         
@@ -237,7 +258,7 @@ async def run_main_loop(
                         if not sal:
                             weights_logger.info("Combined salience is empty. Assigning weights only to young UIDs if any.")
                             
-                        uids = metagraph.uids.tolist()
+                        uids = uids_list
                             
                        
                         young_uids = {uid for uid, age in uid_ages.items() if age < 32000}
@@ -278,31 +299,50 @@ async def run_main_loop(
                         weights_logger.info(f"Final tensor sum before setting weights: {final_w.sum().item()}")
                         
                         try:
-                            thread_sub = bt.subtensor(network=cli_args.network)
-                            thread_wallet = bt.wallet(
-                                name=getattr(cli_args, "wallet.name"), 
-                                hotkey=getattr(cli_args, "wallet.hotkey")
-                            )
+                            thread_sub = bt.subtensor(network=network)
+                            thread_wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
                             thread_sub.set_weights(
-                                netuid=cli_args.netuid, wallet=thread_wallet,
-                                uids=metagraph.uids, weights=final_w,
+                                netuid=netuid, wallet=thread_wallet,
+                                uids=torch.tensor(uids), weights=final_w,
                                 wait_for_inclusion=False,
                             )
                             weights_logger.info(f"Weights set at block {block_snapshot} (max={final_w.max():.4f})")
                         except Exception as e:
                             weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
+                        finally:
+                            try:
+                                del training_data
+                                del final_w
+                                del w
+                            except Exception:
+                                pass
+                            gc.collect()
 
                     max_block_for_training = current_block - config.TASK_INTERVAL
                     async with datalog._lock:
-                        training_data_copy = copy.deepcopy(datalog.get_training_data(max_block_number=max_block_for_training))
+                                                                                                      
+                        training_data_copy = build_training_data(
+                            datalog,
+                            max_block_number=max_block_for_training,
+                            skip_initial_timesteps=0,
+                            max_uids=None,
+                            dtype=np.float16,
+                        )
                         uid_ages_copy = copy.deepcopy(datalog.uid_age_in_blocks)
 
+                    uids_list = mg.uids.tolist()
                     weight_thread = threading.Thread(
                         target=worker,
-                        args=(training_data_copy, uid_ages_copy, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
+                        args=(training_data_copy, uid_ages_copy, current_block, uids_list, args.network, getattr(args, "wallet.name"), getattr(args, "wallet.hotkey"), args.netuid),
                         daemon=True,
                     )
                     weight_thread.start()
+                    try:
+                        del training_data_copy
+                        del uid_ages_copy
+                    except Exception:
+                        pass
+                    gc.collect()
 
             except KeyboardInterrupt:
                 stop_event.set()
