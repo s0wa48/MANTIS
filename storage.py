@@ -4,6 +4,9 @@ import logging
 import os
 import pickle
 import ast
+import gc
+import ctypes
+import ctypes.util
 from typing import Any, Dict, List
 import requests
 import asyncio
@@ -116,25 +119,35 @@ class DataLog:
         """Recomputes the age of each UID based on its first valid payload."""
         logger.info("Recomputing UID age in blocks...")
         first_payload_timestep = {}
-        
-        all_uids = self._get_all_uids_unsafe()
-        for uid in all_uids:
-            for ts, cache_step in enumerate(self.plaintext_cache):
-                if uid in cache_step:
-                    assets_data = cache_step[uid]
-                    is_zero = all(v == 0.0 for asset_vec in assets_data.values() for v in asset_vec)
-                    if not is_zero:
-                        first_payload_timestep[uid] = ts
-                        break
-        
-        current_block = self.blocks[-1] if self.blocks else 0
-        self.uid_age_in_blocks = {}
-        for uid, ts in first_payload_timestep.items():
-            if ts < len(self.blocks):
-                first_block = self.blocks[ts]
-                self.uid_age_in_blocks[uid] = current_block - first_block
-        
-        logger.info(f"UID ages recomputed for {len(self.uid_age_in_blocks)} UIDs.")
+        try:
+            all_uids = self._get_all_uids_unsafe()
+            for uid in all_uids:
+                for ts, cache_step in enumerate(self.plaintext_cache):
+                    if uid in cache_step:
+                        assets_data = cache_step[uid]
+                        is_zero = all(v == 0.0 for asset_vec in assets_data.values() for v in asset_vec)
+                        if not is_zero:
+                            first_payload_timestep[uid] = ts
+                            break
+            current_block = self.blocks[-1] if self.blocks else 0
+            self.uid_age_in_blocks = {}
+            for uid, ts in first_payload_timestep.items():
+                if ts < len(self.blocks):
+                    first_block = self.blocks[ts]
+                    self.uid_age_in_blocks[uid] = current_block - first_block
+            logger.info(f"UID ages recomputed for {len(self.uid_age_in_blocks)} UIDs.")
+        finally:
+            try:
+                del first_payload_timestep
+                del all_uids
+                del assets_data
+            except Exception:
+                pass
+            try:
+                gc.collect()
+                _malloc_trim()
+            except Exception:
+                pass
 
     
 
@@ -420,6 +433,54 @@ class DataLog:
                     if blk in self.raw_payloads:
                         del self.raw_payloads[blk]
 
+    def trim_initial_timesteps(self, n: int) -> None:
+        """Remove the first n timesteps from blocks, asset_prices, and plaintext_cache.
+        This helps drop historical data that is always skipped during training.
+        """
+        try:
+            n = int(max(0, n))
+            if n <= 0:
+                return
+            if len(self.blocks) <= n:
+                                            
+                self.blocks = []
+                self.asset_prices = []
+                self.plaintext_cache = []
+                self.raw_payloads = {}
+                return
+            kept_blocks = set(self.blocks[n:])
+            self.blocks = self.blocks[n:]
+            self.asset_prices = self.asset_prices[n:] if self.asset_prices else []
+            self.plaintext_cache = self.plaintext_cache[n:]
+                                                   
+            try:
+                self.raw_payloads = {b: v for b, v in self.raw_payloads.items() if b in kept_blocks}
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("trim_initial_timesteps failed")
+
+    def prune_to_last_n_timesteps(self, keep: int) -> None:
+        """Keep only the last `keep` timesteps of blocks, asset_prices, plaintext_cache.
+        Also prunes raw_payloads for removed blocks.
+        """
+        try:
+            keep = int(max(0, keep))
+            total = len(self.blocks)
+            if keep <= 0 or total <= keep:
+                return
+            start = total - keep
+            kept_blocks = set(self.blocks[start:])
+            self.blocks = self.blocks[start:]
+            self.asset_prices = self.asset_prices[start:] if self.asset_prices else []
+            self.plaintext_cache = self.plaintext_cache[start:]
+            try:
+                self.raw_payloads = {b: v for b, v in self.raw_payloads.items() if b in kept_blocks}
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("prune_to_last_n_timesteps failed")
+
     def get_training_data(self, max_block_number: int | None = None) -> Dict[str, tuple[dict[int, list], list[float], list[int]]] | None:
         """
         Get training data for all assets with price change filtering.
@@ -570,11 +631,15 @@ class DataLog:
             datalog_ref = self 
 
         try:
-           
             await asyncio.to_thread(_deepcopy_and_save, datalog_ref, path)
             logger.info(f"Datalog saved to {path}")
         except Exception as e:
             logger.error(f"Failed to save datalog to {path}: {e}")
+        finally:
+            try:
+                _malloc_trim()
+            except Exception:
+                pass
 
     @staticmethod
     def load(path: str) -> "DataLog":
@@ -615,8 +680,20 @@ class DataLog:
 
 
 def _deepcopy_and_save(datalog_ref: "DataLog", path: str) -> None:
-    datalog_copy = copy.deepcopy(datalog_ref)
-    _save_datalog(datalog_copy, path)
+    datalog_copy = None
+    try:
+        datalog_copy = copy.deepcopy(datalog_ref)
+        _save_datalog(datalog_copy, path)
+    finally:
+        try:
+            del datalog_copy
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            _malloc_trim()
+        except Exception:
+            pass
 
 
 def _save_datalog(datalog: "DataLog", path: str) -> None:
@@ -635,5 +712,20 @@ def _save_datalog(datalog: "DataLog", path: str) -> None:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise 
+
+
+def _malloc_trim() -> None:
+    """Advise the allocator to return free memory to the OS (Linux).
+    Safe no-op on non-glibc platforms.
+    """
+    try:
+        libc_name = ctypes.util.find_library("c")
+        if not libc_name:
+            return
+        libc = ctypes.CDLL(libc_name)
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+    except Exception:
+        pass
 
 
