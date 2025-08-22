@@ -1,4 +1,4 @@
-
+\
 import config
 import os
 import logging
@@ -92,22 +92,9 @@ def salience(
         num_uids = len(uids)
         T = len(asset_returns)
 
-       
-        X = np.zeros((T, num_uids * emb_dim), dtype=np.float16)
-        for uid, hist in history_dict.items():
-            if uid in uid_to_idx and len(hist) == T:
-                idx = uid_to_idx[uid]
-                X[:, idx * emb_dim : (idx + 1) * emb_dim] = np.asarray(hist, dtype=np.float16)
-
+                                                                               
         y_bin = (np.asarray(asset_returns, dtype=np.float32) > 0).astype(np.float32)
-
-       
-        valid_rows = ~np.isnan(y_bin)
-        X = X[valid_rows]
-        y_bin = y_bin[valid_rows]
-        block_arr = np.asarray(sample_blocks, dtype=np.int64)[valid_rows]
-
-        T = X.shape[0]
+        block_arr = np.asarray(sample_blocks, dtype=np.int64)
         if T < 500 or len(np.unique(y_bin)) < 2:
             continue
 
@@ -121,7 +108,7 @@ def salience(
         weighted_w_sum = 0.0
 
        
-        target_block_span = CHUNK_SIZE * 60 // 12 
+        target_block_span = CHUNK_SIZE * 60 // 12
         indices = []
         start = 0
         while True:
@@ -129,10 +116,9 @@ def salience(
             if val_start_idx >= T:
                 break
             target_block = block_arr[start] + target_block_span
-            end_candidates = np.where(block_arr >= target_block)[0]
-            end_idx = int(end_candidates[0]) if end_candidates.size > 0 else T
-            end_idx = min(end_idx, start + CHUNK_SIZE)
-            if end_idx > T:
+            end_idx = int(np.searchsorted(block_arr, target_block, side="left"))
+            end_idx = min(end_idx, start + CHUNK_SIZE, T)
+            if end_idx <= start:
                 break
             indices.append((start, val_start_idx, end_idx))
             start = end_idx
@@ -154,20 +140,22 @@ def salience(
 
        
         first_nz_idx = np.full(num_uids, T, dtype=np.int32)
-        for i in range(num_uids):
-            cols = slice(i * emb_dim, (i + 1) * emb_dim)
-            nz = (np.abs(X[:, cols]).sum(axis=1) > 0)
-            nz_idx = np.where(nz)[0]
+        for i, uid in enumerate(uids):
+            hist = history_dict.get(uid)
+            if hist is None or len(hist) != T:
+                continue
+            nz = (hist != 0).any(axis=1)
+            nz_idx = np.flatnonzero(nz)
             if nz_idx.size > 0:
                 first_nz_idx[i] = int(nz_idx[0])
 
         for (train_start, val_start, val_end) in indices:
             train_end = val_start
-            X_train, y_train = X[:train_end], y_bin[:train_end]
-            X_val, y_val = X[val_start:val_end], y_bin[val_start:val_end]
+            y_train = y_bin[:train_end]
+            y_val = y_bin[val_start:val_end]
 
            
-            if (len(X_train) < 200
+            if (train_end < 200
                 or len(np.unique(y_train)) < 2
                 or len(np.unique(y_val)) < 2):
                 pbar.update(1)
@@ -184,12 +172,16 @@ def salience(
             sel_eval_start = max(0, sel_eval_end - CHUNK_SIZE)
             sel_fit_end = max(0, sel_eval_start - EMBARGO_IDX)
             sel_auc = np.zeros(num_uids, dtype=np.float32)
-            for i in range(num_uids):
+            for i, uid in enumerate(uids):
                 if first_nz_idx[i] >= sel_fit_end or sel_fit_end < 50:
                     sel_auc[i] = 0.5
                     continue
-                cols = slice(i * emb_dim, (i + 1) * emb_dim)
-                Xi_fit = X[:sel_fit_end, cols].astype(np.float32, copy=False)
+                hist = history_dict.get(uid)
+                if hist is None or len(hist) != T:
+                    sel_auc[i] = 0.5
+                    continue
+                                                                         
+                Xi_fit = hist[:sel_fit_end].astype(np.float32, copy=False)
                 yi_fit = y_bin[:sel_fit_end]
                 if len(np.unique(yi_fit)) < 2:
                     sel_auc[i] = 0.5
@@ -197,7 +189,7 @@ def salience(
                 try:
                     clf = LogisticRegression(penalty='l2', C=0.5, class_weight='balanced', solver='lbfgs', max_iter=200)
                     clf.fit(Xi_fit, yi_fit)
-                    Xi_eval = X[sel_eval_start:sel_eval_end, cols].astype(np.float32, copy=False)
+                    Xi_eval = hist[sel_eval_start:sel_eval_end].astype(np.float32, copy=False)
                     yi_eval = y_bin[sel_eval_start:sel_eval_end]
                     if len(np.unique(yi_eval)) < 2 or Xi_eval.shape[0] == 0:
                         sel_auc[i] = 0.5
@@ -228,11 +220,8 @@ def salience(
                 if val_start_oos >= fit_end_pred:
                     break
                 target_block_oos = block_arr_train[start_oos] + target_block_span
-                end_candidates_oos = np.where(block_arr_train >= target_block_oos)[0]
-                end_idx_oos = int(end_candidates_oos[0]) if end_candidates_oos.size > 0 else fit_end_pred
+                end_idx_oos = int(np.searchsorted(block_arr_train, target_block_oos, side="left"))
                 end_idx_oos = min(end_idx_oos, start_oos + CHUNK_SIZE, fit_end_pred)
-                if end_idx_oos > fit_end_pred:
-                    end_idx_oos = fit_end_pred
                 if end_idx_oos <= val_start_oos:
                     break
                 oos_segments.append((start_oos, val_start_oos, end_idx_oos))
@@ -241,9 +230,12 @@ def salience(
             for j, i in enumerate(selected_idx):
                 if first_nz_idx[i] >= fit_end_pred or fit_end_pred < 50:
                     continue
-                cols = slice(i * emb_dim, (i + 1) * emb_dim)
-                Xi_all = X[:, cols].astype(np.float32, copy=False)
-               
+                uid = uids[int(i)]
+                hist = history_dict.get(uid)
+                if hist is None or len(hist) != T:
+                    continue
+                Xi_all = hist.astype(np.float32, copy=False)
+
                 for (oos_train_start, oos_val_start, oos_val_end) in oos_segments:
                     tr_fit_end_oos = max(0, oos_val_start - LAG)
                     if tr_fit_end_oos < 50:
@@ -259,7 +251,6 @@ def salience(
                     except Exception:
                         continue
 
-               
                 try:
                     Xi_fit = Xi_all[:fit_end_pred]
                     yi_fit = y_bin[:fit_end_pred]
@@ -290,19 +281,34 @@ def salience(
                 logger.warning(f"[{asset_name}] XGBoost training/eval failed: {e}")
                 pbar.update(1)
                 continue
+            finally:
+                try:
+                    del dtrain
+                    del dval
+                except Exception:
+                    pass
 
            
             window_imp = np.zeros(num_uids, dtype=np.float32)
             for j, col_idx in enumerate(selected_idx):
-                X_val_perm_sel = X_val_sel.copy()
-                X_val_perm_sel[:, j] = np.random.permutation(X_val_perm_sel[:, j])
+                                                                                                
+                col = X_val_sel[:, j].copy()
+                perm_idx = np.random.permutation(col.shape[0])
+                X_val_sel[:, j] = col[perm_idx]
                 try:
-                    perm_probs = bst.predict(xgb.DMatrix(X_val_perm_sel, label=y_val))
+                    dval_perm = xgb.DMatrix(X_val_sel, label=y_val)
+                    perm_probs = bst.predict(dval_perm)
                     perm_auc = float(roc_auc_score(y_val, perm_probs))
                     delta = base_auc - perm_auc
                     window_imp[col_idx] = delta if delta > 0.0 else 0.0
                 except Exception:
                     window_imp[col_idx] = 0.0
+                finally:
+                    X_val_sel[:, j] = col
+                    try:
+                        del dval_perm
+                    except Exception:
+                        pass
 
            
             scale = max((base_auc - 0.5) / 0.5, 0.0)
