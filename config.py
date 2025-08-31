@@ -20,9 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+
 import os
 
-DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/mantis_datalog.pkl.gz"
+DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/mantis_datalog.pkl"
 
 PRICE_DATA_URL = "https://pub-ba8c1b8edb8046edaccecbd26b5ca7f8.r2.dev/latest_prices.json"
 
@@ -30,6 +31,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(PROJECT_ROOT, ".storage")
 
 NETUID = 123
+
+NUM_UIDS = 256
 
 ASSETS = ["BTC", "ETH", "EURUSD", "GBPUSD", "CADUSD", "NZDUSD", "CHFUSD", "XAUUSD", "XAGUSD"]
 
@@ -47,10 +50,14 @@ ASSET_EMBEDDING_DIMS = {
 
 MAX_UNCHANGED_TIMESTEPS = 15
 
+HIDDEN_SIZE = 32
+LEARNING_RATE = 1e-3
+
 SEED = 42
 
-SAMPLE_STEP = 5
+SAMPLE_EVERY = 5
 
 LAG = 60
 
 TASK_INTERVAL = 500 
+
