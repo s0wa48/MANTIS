@@ -9,25 +9,19 @@ import time
 import asyncio
 import copy
 import json
-import gzip
-import pickle
 
 import bittensor as bt
 import torch
 import aiohttp
 from dotenv import load_dotenv
-from logging.handlers import RotatingFileHandler
-import numpy as np
-import gc
+import requests
 
 import config
 from cycle import get_miner_payloads
 from model import salience as sal_fn
-from storage import DataLog
-from get_training_data import build_training_data, coerce_plaintext_cache_to_dtype
+from ledger import DataLog
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(_BASE_DIR, "logs")
+LOG_DIR = os.path.expanduser("~/new_system_mantis")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -40,11 +34,10 @@ logging.basicConfig(
 )
 
 weights_logger = logging.getLogger("weights")
-weights_logger.setLevel(logging.INFO)
-weights_handler = RotatingFileHandler(
-    os.path.join(LOG_DIR, "weights.log"), mode="a", maxBytes=20 * 1024 * 1024, backupCount=3
+weights_logger.setLevel(logging.DEBUG)
+weights_logger.addHandler(
+    logging.FileHandler(os.path.join(LOG_DIR, "weights.log"), mode="a")
 )
-weights_logger.addHandler(weights_handler)
 
 for noisy in ("websockets", "aiohttp"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -52,21 +45,53 @@ for noisy in ("websockets", "aiohttp"):
 load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
-DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
+DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl")
 SAVE_INTERVAL = 480
 
+
+async def _fetch_price_source(session, url, parse_json=True):
+    async with session.get(url, timeout=5) as resp:
+        resp.raise_for_status()
+        if parse_json:
+            return await resp.json()
+        else:
+            return await resp.text()
+
+async def _get_price_from_sources(session, source_list):
+    for name, url, parser in source_list:
+        try:
+            parse_json = not url.endswith("e=csv")
+            data = await _fetch_price_source(session, url, parse_json=parse_json)
+            price = parser(data)
+            if price is not None:
+                return price
+        except Exception:
+            continue
+    return None
+
+
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
+    base = {asset: 0.0 for asset in config.ASSETS}
     try:
         async with session.get(config.PRICE_DATA_URL) as resp:
             resp.raise_for_status()
             text = await resp.text()
             data = json.loads(text)
-            prices = data.get("prices", {})
-            logging.info(f"Fetched prices for {len(prices)} assets: {prices}")
-            return prices
+            fetched = data.get("prices", {}) or {}
+            out = dict(base)
+            for asset in config.ASSETS:
+                v = fetched.get(asset)
+                try:
+                    fv = float(v)
+                    if fv > 0 and fv < float('inf'):
+                        out[asset] = fv
+                except Exception:
+                    pass
+            logging.info(f"Fetched prices, filled zeros where missing: {out}")
+            return out
     except Exception as e:
         logging.error(f"Failed to fetch prices from {config.PRICE_DATA_URL}: {e}")
-        return {}
+        return base
 
 def main():
     p = argparse.ArgumentParser()
@@ -75,25 +100,16 @@ def main():
     p.add_argument("--network", default="finney")
     p.add_argument("--netuid", type=int, default=config.NETUID)
     p.add_argument(
-        "--no_download_datalog", 
-        action="store_true", 
-        help="Start with a fresh datalog instead of downloading from the archive."
-    )
-    p.add_argument(
         "--do_save",
         action="store_true",
         default=False,
         help="Whether to save the datalog periodically."
     )
     p.add_argument(
-        "--archive",
-        default=None,
-        help="Path to local datalog .pkl.gz (defaults to STORAGE_DIR/mantis_datalog.pkl.gz)"
-    )
-    p.add_argument(
-        "--prefer_local",
-        action="store_true",
-        help="If set, load existing local archive if it exists; otherwise download"
+        "--save-every-seconds",
+        type=int,
+        default=SAVE_INTERVAL * 12,
+        help="How often to save the datalog, in seconds (default: SAVE_INTERVAL blocks * 12s).",
     )
     args = p.parse_args()
 
@@ -108,34 +124,24 @@ def main():
             time.sleep(30)
             continue
 
-    if args.no_download_datalog:
-        logging.info("`--no_download_datalog` flag set. Starting with a new, empty DataLog.")
-        datalog = DataLog()
-    else:
-        archive_path = args.archive or DATALOG_PATH
-        if args.prefer_local and os.path.exists(archive_path):
-            logging.info("Loading local datalog from %s", archive_path)
-            try:
-                with gzip.open(archive_path, "rb") as f:
-                    datalog = pickle.load(f)
-                try:
-                    datalog.raw_payloads = {}
-                    logging.info("Pruned raw_payloads after local load (prefer_local).")
-                except Exception:
-                    pass
-            except Exception as e:
-                logging.warning("Local load failed (%s). Falling back to download.", e)
-                datalog = DataLog.load(archive_path)
-        else:
-            datalog = DataLog.load(archive_path)
+    if not os.path.exists(DATALOG_PATH):
+        try:
+            logging.info(f"Attempting to download initial datalog from {config.DATALOG_ARCHIVE_URL} → {DATALOG_PATH}")
+            os.makedirs(os.path.dirname(DATALOG_PATH), exist_ok=True)
+            r = requests.get(config.DATALOG_ARCHIVE_URL, timeout=600, stream=True)
+            r.raise_for_status()
+            tmp = DATALOG_PATH + ".tmp"
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(tmp, DATALOG_PATH)
+            logging.info("Downloaded datalog to local storage.")
+        except Exception:
+            logging.info("Remote datalog unavailable; starting with a new, empty ledger.")
+    logging.info(f"Loading datalog from {DATALOG_PATH}...")
+    datalog = DataLog.load(DATALOG_PATH)
         
-                                                                           
-    try:
-        converted = coerce_plaintext_cache_to_dtype(datalog, np.float16)
-        logging.info(f"Coerced {converted} asset vectors to np.float16 in plaintext_cache.")
-    except Exception:
-        logging.exception("Failed to coerce plaintext_cache to fp16")
-
     stop_event = asyncio.Event()
 
     try:
@@ -144,15 +150,20 @@ def main():
         logging.info("Exit signal received. Shutting down.")
     finally:
         stop_event.set()
+        if args.do_save:
+            try:
+                logging.info("Final save on shutdown...")
+                asyncio.run(datalog.save(DATALOG_PATH))
+            except Exception:
+                logging.exception("Final save failed.")
         logging.info("Shutdown complete.")
 
 
-async def decrypt_loop(datalog: DataLog, mg: bt.metagraph, stop_event: asyncio.Event):
+async def decrypt_loop(datalog: DataLog, stop_event: asyncio.Event):
     logging.info("Decryption loop started.")
     while not stop_event.is_set():
         try:
-            uid_to_hotkey = dict(zip(mg.uids.tolist(), mg.hotkeys))
-            await datalog.process_pending_payloads(uid_to_hotkey=uid_to_hotkey)
+            await datalog.process_pending_payloads()
         except asyncio.CancelledError:
             break
         except Exception:
@@ -161,15 +172,19 @@ async def decrypt_loop(datalog: DataLog, mg: bt.metagraph, stop_event: asyncio.E
     logging.info("Decryption loop stopped.")
 
 
-async def save_loop(datalog: DataLog, do_save: bool, stop_event: asyncio.Event):
+async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, stop_event: asyncio.Event):
     if not do_save:
         logging.info("DO_SAVE is False, skipping periodic saves.")
         return
     logging.info("Save loop started.")
-    save_interval_seconds = SAVE_INTERVAL * 12
+    try:
+        logging.info("Initiating initial datalog save...")
+        await datalog.save(DATALOG_PATH)
+    except Exception:
+        logging.exception("Initial save failed.")
     while not stop_event.is_set():
         try:
-            await asyncio.sleep(save_interval_seconds)
+            await asyncio.sleep(save_every_seconds)
             logging.info("Initiating periodic datalog save...")
             await datalog.save(DATALOG_PATH)
         except asyncio.CancelledError:
@@ -181,6 +196,37 @@ async def save_loop(datalog: DataLog, do_save: bool, stop_event: asyncio.Event):
 
 subtensor_lock = threading.Lock()
 
+
+async def get_current_block_with_retry(sub: bt.subtensor, lock: threading.Lock, timeout: int = 10) -> int:
+    """
+    Fetches the current block number from the subtensor with a retry mechanism.
+    This function will attempt to fetch the block indefinitely until it succeeds.
+    """
+    retry_delay = 5
+    while True:
+        try:
+            def get_block():
+                with lock:
+                    return sub.get_current_block()
+
+            current_block = await asyncio.wait_for(
+                asyncio.to_thread(get_block),
+                timeout=float(timeout)
+            )
+            return current_block
+        except asyncio.TimeoutError:
+            logging.warning(
+                f"Getting current block timed out after {timeout}s. "
+                f"Retrying in {retry_delay}s..."
+            )
+        except Exception as e:
+            logging.error(
+                f"An unexpected error occurred while getting current block: {e}. "
+                f"Retrying in {retry_delay}s..."
+            )
+        await asyncio.sleep(retry_delay)
+
+
 async def run_main_loop(
     args: argparse.Namespace,
     sub: bt.subtensor,
@@ -189,35 +235,25 @@ async def run_main_loop(
     datalog: DataLog,
     stop_event: asyncio.Event,
 ):
-    last_block = sub.get_current_block()
+    last_block = await get_current_block_with_retry(sub, subtensor_lock)
     weight_thread: threading.Thread | None = None
 
     tasks = [
-        asyncio.create_task(decrypt_loop(datalog, mg, stop_event)),
-        asyncio.create_task(save_loop(datalog, args.do_save, stop_event)),
+        asyncio.create_task(decrypt_loop(datalog, stop_event)),
+        asyncio.create_task(save_loop(datalog, args.do_save, args.save_every_seconds, stop_event)),
     ]
 
     async with aiohttp.ClientSession() as session:
         while not stop_event.is_set():
             try:
-                                                                                 
-                if weight_thread is not None and not weight_thread.is_alive():
-                    try:
-                        weight_thread.join(timeout=0.1)
-                    except Exception:
-                        pass
-                    weight_thread = None
-                    gc.collect()
-
-                with subtensor_lock:
-                    current_block = sub.get_current_block()
+                current_block = await get_current_block_with_retry(sub, subtensor_lock)
                 
                 if current_block == last_block:
                     await asyncio.sleep(1)
                     continue
                 last_block = current_block
 
-                if current_block % config.SAMPLE_STEP != 0:
+                if current_block % config.SAMPLE_EVERY != 0:
                     continue
                 logging.info(f"Sampled block {current_block}")
 
@@ -225,69 +261,98 @@ async def run_main_loop(
                     with subtensor_lock:
                         mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
-                    await datalog.sync_miners(dict(zip(mg.uids.tolist(), mg.hotkeys)))
-                    datalog.compute_and_display_uid_ages()
+                    async with datalog._lock:
+                        datalog.prune_hotkeys(mg.hotkeys)
 
                 asset_prices = await get_asset_prices(session)
                 if not asset_prices:
                     logging.error("Failed to fetch prices for required assets.")
                     continue
-
+                
                 payloads = await get_miner_payloads(netuid=args.netuid, mg=mg)
-                await datalog.append_step(current_block, asset_prices, payloads)
+                logging.info(f"Retrieved {len(payloads)} payloads from miners. Hotkey sample: {list(payloads.keys())[:3]}")
+                await datalog.append_step(current_block, asset_prices, payloads, mg)
+
+                
+                hotkey_to_uid = {hk: uid for uid, hk in zip(mg.uids.tolist(), mg.hotkeys)}
+                uids_in_mg = mg.uids.tolist()
+                for uid in uids_in_mg:
+                    if uid not in datalog.uid_age_in_blocks:
+                        datalog.uid_age_in_blocks[uid] = 0
+                
+                current_uids = set(uids_in_mg)
+                for uid in list(datalog.uid_age_in_blocks.keys()):
+                    if uid not in current_uids:
+                        del datalog.uid_age_in_blocks[uid]
+
 
                 if (
                     current_block % config.TASK_INTERVAL == 0
                     and (weight_thread is None or not weight_thread.is_alive())
                     and len(datalog.blocks) >= config.LAG * 2 + 1
                 ):
-                    def worker(training_data, uid_ages, block_snapshot, uids_list, network, wallet_name, wallet_hotkey, netuid):
+                    datalog_clone = copy.deepcopy(datalog)
+
+                    def worker(dlog, uid_ages, block_snapshot, metagraph, cli_args):
+                        training_data = dlog.get_training_data_sync(
+                            max_block_number=block_snapshot - config.TASK_INTERVAL
+                        )
                         if not training_data:
                             weights_logger.warning("Not enough data for salience, but checking for young UIDs.")
                         
                         weights_logger.info(f"=== Starting weight calculation | block {block_snapshot} ===")
                         
-                        weights_logger.info("Calculating general salience...")
-                        general_sal = sal_fn(training_data) if training_data else {}
-                        if not general_sal:
-                            weights_logger.info("General salience computation returned empty.")
+                        weights_logger.info("Calculating salience...")
+                        general_sal_hk = sal_fn(training_data) if training_data else {}
+                        if not general_sal_hk:
+                            weights_logger.info("Salience computation returned empty.")
 
-                        weights_logger.info("Using general salience only (10-day skipped).")
-                        sal = general_sal
+                        hk2uid = {hk: uid for uid, hk in zip(metagraph.uids.tolist(), metagraph.hotkeys)}
+                        general_sal = {hk2uid.get(hk, -1): s for hk, s in general_sal_hk.items() if hk in hk2uid}
+                        sal = {uid: score for uid, score in general_sal.items() if uid != -1}
 
                         if not sal:
-                            weights_logger.info("Combined salience is empty. Assigning weights only to young UIDs if any.")
-                            
-                        uids = uids_list
-                            
-                       
-                        young_uids = {uid for uid, age in uid_ages.items() if age < 32000}
-                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<32000 blocks).")
+                            weights_logger.info("Salience is empty. Assigning weights only to young UIDs if any.")
+                        
+                        uids = metagraph.uids.tolist()
+                        
+                        young_uids = {uid for uid, age in uid_ages.items() if age < 36000}
+                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<36000 blocks).")
+
+                        mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
+                        
+                        total_mature_score = sum(mature_uid_scores.values())
                         
                         fixed_weight_per_young_uid = 0.0001
+                        
                         active_young_uids = {uid for uid in young_uids if uid in uids}
                         
-                       
-                       
-                        final_weights = {uid: float(sal.get(uid, 0.0)) for uid in uids}
+                        weight_for_mature_uids = 1.0 - (len(active_young_uids) * fixed_weight_per_young_uid)
+                        weight_for_mature_uids = max(0, weight_for_mature_uids)
+
+                        final_weights = {}
+
+                        if total_mature_score > 0 and weight_for_mature_uids > 0:
+                            for uid, score in mature_uid_scores.items():
+                                if uid in uids:
+                                    final_weights[uid] = (score / total_mature_score) * weight_for_mature_uids
                         
-                       
                         for uid in active_young_uids:
-                            final_weights[uid] = final_weights.get(uid, 0.0) + fixed_weight_per_young_uid
-                            
+                            final_weights[uid] = fixed_weight_per_young_uid
+
                         if not final_weights:
                             weights_logger.warning("No weights to set after processing.")
                             return
-                            
+
                         total_weight = sum(final_weights.values())
                         if total_weight <= 0:
                             weights_logger.warning("Total calculated weight is zero or negative, skipping set.")
                             return
-                            
+                        
                         normalized_weights = {uid: w / total_weight for uid, w in final_weights.items()}
-                            
+
                         w = torch.tensor([normalized_weights.get(uid, 0.0) for uid in uids], dtype=torch.float32)
-                            
+                        
                         if w.sum() > 0:
                             final_w = w / w.sum()
                         else:
@@ -299,50 +364,29 @@ async def run_main_loop(
                         weights_logger.info(f"Final tensor sum before setting weights: {final_w.sum().item()}")
                         
                         try:
-                            thread_sub = bt.subtensor(network=network)
-                            thread_wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
+                            thread_sub = bt.subtensor(network=cli_args.network)
+                            thread_wallet = bt.wallet(
+                                name=getattr(cli_args, "wallet.name"), 
+                                hotkey=getattr(cli_args, "wallet.hotkey")
+                            )
                             thread_sub.set_weights(
-                                netuid=netuid, wallet=thread_wallet,
-                                uids=torch.tensor(uids), weights=final_w,
+                                netuid=cli_args.netuid, wallet=thread_wallet,
+                                uids=metagraph.uids, weights=final_w,
                                 wait_for_inclusion=False,
                             )
                             weights_logger.info(f"Weights set at block {block_snapshot} (max={final_w.max():.4f})")
                         except Exception as e:
                             weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
-                        finally:
-                            try:
-                                del training_data
-                                del final_w
-                                del w
-                            except Exception:
-                                pass
-                            gc.collect()
 
-                    max_block_for_training = current_block - config.TASK_INTERVAL
                     async with datalog._lock:
-                                                                                                      
-                        training_data_copy = build_training_data(
-                            datalog,
-                            max_block_number=max_block_for_training,
-                            skip_initial_timesteps=0,
-                            max_uids=None,
-                            dtype=np.float16,
-                        )
                         uid_ages_copy = copy.deepcopy(datalog.uid_age_in_blocks)
 
-                    uids_list = mg.uids.tolist()
                     weight_thread = threading.Thread(
                         target=worker,
-                        args=(training_data_copy, uid_ages_copy, current_block, uids_list, args.network, getattr(args, "wallet.name"), getattr(args, "wallet.hotkey"), args.netuid),
+                        args=(datalog_clone, uid_ages_copy, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
                         daemon=True,
                     )
                     weight_thread.start()
-                    try:
-                        del training_data_copy
-                        del uid_ages_copy
-                    except Exception:
-                        pass
-                    gc.collect()
 
             except KeyboardInterrupt:
                 stop_event.set()
