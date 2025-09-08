@@ -235,7 +235,16 @@ async def download(url: str, max_size_bytes: int | None = None):
 
         if not isinstance(data['ciphertext'], str):
             raise ValueError("'ciphertext' must be a string.")
-        
+
+        hex_ct = data['ciphertext']
+        if (
+            len(hex_ct) > config.MAX_CIPHERTEXT_HEX_LEN
+            or len(hex_ct) % 2 != 0
+            or not re.fullmatch(r"[0-9a-fA-F]*", hex_ct)
+        ):
+            raise ValueError("'ciphertext' is not valid hex or exceeds size limit")
+
+
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         logger.warning(f"Invalid payload from {url}: {e}")
         raise ValueError("Invalid payload format") from e
