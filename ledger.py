@@ -241,6 +241,13 @@ class MultiAssetLedger:
                 vecs = self._zero_vecs()
                 if sig and ct_hex:
                     try:
+                        if (
+                            not isinstance(ct_hex, str)
+                            or len(ct_hex) > config.MAX_CIPHERTEXT_HEX_LEN
+                            or len(ct_hex) % 2 != 0
+                            or not re.fullmatch(r"[0-9a-fA-F]*", ct_hex)
+                        ):
+                            raise ValueError("invalid ciphertext")
                         pt = self.tlock.tld(bytes.fromhex(ct_hex), sig).decode("utf-8")
                         emb_str, hk_in = pt.rsplit(":::", 1)
                         if hk_in != hk:
