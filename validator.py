@@ -315,8 +315,37 @@ async def run_main_loop(
                         
                         uids = metagraph.uids.tolist()
                         
-                        young_uids = {uid for uid, age in uid_ages.items() if age < 36000}
-                        weights_logger.info(f"Found {len(young_uids)} young UIDs (<36000 blocks).")
+                        SAMPLE_EVERY = int(config.SAMPLE_EVERY)
+                        young_threshold = 36000
+                        hk2idx = getattr(dlog, 'hk2idx', {}) if hasattr(dlog, 'hk2idx') else {}
+                        idx2hk = {idx: hk for hk, idx in hk2idx.items()}
+
+                        hotkey_first_block: dict[str, int] = {}
+                        for asset, ds in dlog.datasets.items():
+                            if not ds.challenges:
+                                continue
+                            ch = ds.challenges[0]
+                            for sidx, emb in ch.emb_sparse.items():
+                                if emb is None or emb.ndim != 2:
+                                    continue
+                                H = emb.shape[0]
+                                for hk_idx in range(H):
+                                    hk = idx2hk.get(hk_idx)
+                                    if not hk or hk in hotkey_first_block:
+                                        continue
+                                    row = emb[hk_idx, :]
+                                    if np.any(row != 0):
+                                        hotkey_first_block[hk] = int(sidx) * SAMPLE_EVERY
+
+                        young_uids = set()
+                        for hk, first_block in hotkey_first_block.items():
+                            age_blocks = block_snapshot - int(first_block)
+                            if age_blocks < young_threshold:
+                                uid = hk2uid.get(hk)
+                                if uid is not None:
+                                    young_uids.add(uid)
+                        weights_logger.info(f"Found {len(young_uids)} young UIDs by hotkey-first-nonzero (<{young_threshold} blocks).")
+                        
 
                         mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
                         
