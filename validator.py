@@ -8,6 +8,7 @@ import time
 import asyncio
 import copy
 import json
+import numpy as np 
 
 import bittensor as bt
 import torch
