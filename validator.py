@@ -11,6 +11,7 @@ import time
 import asyncio
 import copy
 import json
+import pickle
 
 import bittensor as bt
 import torch
@@ -18,7 +19,6 @@ import aiohttp
 from dotenv import load_dotenv
 import requests
 import numpy as np
-import pickle
 
 import config
 from cycle import get_miner_payloads
@@ -411,23 +411,30 @@ async def run_main_loop(
                     if weights_data is None:
                         logging.info(f"No saved weights found at block {current_block}, skipping weight setting.")
                     else:
-                        calc_block = weights_data.get("block", "unknown")
-                        final_w = weights_data["weights"]
-                        saved_uids = weights_data["uids"]
+                        calc_block = weights_data.get("block", 0)
                         
-                        weights_logger.info(f"Setting weights from saved array (calculated at block {calc_block})")
-                        
-                        if list(saved_uids) != mg.uids.tolist():
-                            weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                        # FIX: Sprawdzamy wiek wag
+                        # Jeśli wagi są starsze niż 2000 bloków (np. obliczenia się nie powiodły przez długi czas),
+                        # pomijamy ustawianie, aby nie spamować sieci starymi danymi.
+                        if current_block - calc_block > 2000:
+                             weights_logger.warning(f"Saved weights are too old (calculated at {calc_block}, current {current_block}). Skipping set_weights.")
                         else:
-                            sub.set_weights(
-                                netuid=args.netuid,
-                                wallet=wallet,
-                                uids=mg.uids,
-                                weights=final_w,
-                                wait_for_inclusion=False,
-                            )
-                            weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
+                            final_w = weights_data["weights"]
+                            saved_uids = weights_data["uids"]
+                            
+                            weights_logger.info(f"Setting weights from saved array (calculated at block {calc_block})")
+                            
+                            if list(saved_uids) != mg.uids.tolist():
+                                weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                            else:
+                                sub.set_weights(
+                                    netuid=args.netuid,
+                                    wallet=wallet,
+                                    uids=mg.uids,
+                                    weights=final_w,
+                                    wait_for_inclusion=False,
+                                )
+                                weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
 
             except KeyboardInterrupt:
                 stop_event.set()
@@ -443,10 +450,3 @@ async def run_main_loop(
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
